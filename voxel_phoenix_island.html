@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Phoenix Isle — Voxel Volcano</title>
+<style>
+  :root{--fg:#f4e9d8;--muted:#b9a995;--panel:rgba(14,10,10,.55);--accent:#ff8a2a;}
+  html,body{margin:0;height:100%;overflow:hidden;background:#120b0e;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--fg);}
+  #c{display:block;width:100%;height:100%;touch-action:none;-webkit-user-select:none;user-select:none;}
+  .panel{position:fixed;background:var(--panel);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);border-radius:10px;}
+  #hud{top:max(10px,env(safe-area-inset-top));left:max(10px,env(safe-area-inset-left));padding:10px 12px;line-height:1.35;font-size:13px;pointer-events:none;}
+  #hud h1{margin:0 0 4px;font-size:15px;font-weight:600;letter-spacing:.4px;color:#ffd9a8;}
+  #hud .row{color:var(--muted);}
+  #hud .row b{color:var(--fg);font-weight:600;}
+  #hint{bottom:max(10px,env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);padding:6px 12px;font-size:12px;color:var(--muted);white-space:nowrap;pointer-events:none;transition:opacity .6s;}
+  #ctl{right:max(10px,env(safe-area-inset-right));bottom:max(10px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:8px;padding:8px;}
+  #ctl button{width:46px;height:46px;border-radius:9px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.07);color:var(--fg);font-size:20px;cursor:pointer;touch-action:manipulation;}
+  #ctl button:active{background:rgba(255,138,42,.35);}
+  #ctl button.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset;}
+  #ctl small{display:block;font-size:9px;color:var(--muted);line-height:1;margin-top:2px;}
+  #load{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#120b0e;color:#ffd9a8;font-size:15px;letter-spacing:.5px;z-index:9;transition:opacity .5s;}
+  @media (max-width:640px){#hint{display:none;} #hud{font-size:12px;} #hud h1{font-size:14px;}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="load">forging the island…</div>
+<div id="hud" class="panel">
+  <h1>Phoenix Isle</h1>
+  <div class="row">voxels <b id="vc">—</b></div>
+  <div class="row">fps <b id="fps">—</b></div>
+</div>
+<div id="hint" class="panel">drag to orbit · scroll / pinch to zoom · two fingers or right-drag to pan · WASD / arrows · F focus · N night · R reset</div>
+<div id="ctl" class="panel">
+  <button id="bIn" title="zoom in">+</button>
+  <button id="bOut" title="zoom out">−</button>
+  <button id="bFocus" title="cycle focus">◎<small>island</small></button>
+  <button id="bRot" class="on" title="auto orbit">⟳<small>orbit</small></button>
+  <button id="bNight" title="day / night">☾<small>night</small></button>
+  <button id="bReset" title="reset view">⌂<small>reset</small></button>
+</div>
+
+<!-- ============================================================
+     WORLD GENERATOR — pure code, no DOM / no Three.js dependency.
+     Everything is procedural: seeded RNG + gradient noise.
+     Returns plain arrays so it can be unit-checked headlessly.
+     ============================================================ -->
+<script>
+window.VoxelGen = (function () {
+  'use strict';
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  // 2-D gradient (Perlin-style) noise + fractal Brownian motion.
+  function makeNoise(rand) {
+    const p = []; for (let i = 0; i < 256; i++) p[i] = i;
+    for (let i = 255; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+    const perm = new Uint8Array(512); for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+    const G = [[1, 1], [-1, 1], [1, -1], [-1, -1], [1, 0], [-1, 0], [0, 1], [0, -1]];
+    const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+    const lerp = (a, b, t) => a + (b - a) * t;
+    function noise2(x, y) {
+      const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+      x -= Math.floor(x); y -= Math.floor(y);
+      const u = fade(x), v = fade(y);
+      const aa = G[perm[perm[X] + Y] & 7], ba = G[perm[perm[X + 1] + Y] & 7];
+      const ab = G[perm[perm[X] + Y + 1] & 7], bb = G[perm[perm[X + 1] + Y + 1] & 7];
+      return lerp(
+        lerp(aa[0] * x + aa[1] * y, ba[0] * (x - 1) + ba[1] * y, u),
+        lerp(ab[0] * x + ab[1] * (y - 1), bb[0] * (x - 1) + bb[1] * (y - 1), u), v);
+    }
+    function fbm(x, y, oct, lac, gain) {
+      oct = oct || 4; lac = lac || 2; gain = gain || 0.5;
+      let a = 1, f = 1, s = 0, n = 0;
+      for (let i = 0; i < oct; i++) { s += a * noise2(x * f, y * f); n += a; a *= gain; f *= lac; }
+      return s / n;
+    }
+    return { noise2, fbm };
+  }
+
+  // Colour helpers on packed 0xRRGGBB ints.
+  const rgb = (r, g, b) => (Math.max(0, Math.min(255, r | 0)) << 16) | (Math.max(0, Math.min(255, g | 0)) << 8) | Math.max(0, Math.min(255, b | 0));
+  const shade = (c, k) => rgb(((c >> 16) & 255) * k, ((c >> 8) & 255) * k, (c & 255) * k);
+  const mix = (a, b, t) => rgb(
+    ((a >> 16) & 255) + (((b >> 16) & 255) - ((a >> 16) & 255)) * t,
+    ((a >> 8) & 255) + (((b >> 8) & 255) - ((a >> 8) & 255)) * t,
+    (a & 255) + ((b & 255) - (a & 255)) * t);
+
+  const W = 112;          // grid width (x and z)
+  const SEA = 6;          // water surface voxel sits at y = SEA-1
+  const C = (W - 1) / 2;  // island centre
+  const R = 50;           // nominal island radius
+  const VX = 60, VZ = 52; // volcano centre (slightly off-centre for composition)
+  const CRATER_R = 7.5;
+  const CRATER_FLOOR = 26; // lava surface y inside the crater
+
+  function build(seed) {
+    const rand = mulberry32(seed);
+    const N = makeNoise(rand);
+    const h = new Int16Array(W * W);        // column height: solid voxels occupy y in [0, h-1]
+    const lavaCol = new Uint8Array(W * W);  // 1 = top voxel of this column is lava
+    const idx = (x, z) => x * W + z;
+    const inb = (x, z) => x >= 0 && z >= 0 && x < W && z < W;
+    const hAt = (x, z) => inb(x, z) ? h[idx(x, z)] : 0;
+    const smax = (a, b, k) => k * Math.log(Math.exp(a / k) + Math.exp(b / k)); // soft max
+
+    // ---- 1. height field: noisy island shelf + volcanic cone + crater bowl
+    for (let x = 0; x < W; x++) for (let z = 0; z < W; z++) {
+      const dx = x - C, dz = z - C;
+      const n = N.fbm(x * 0.042 + 11.3, z * 0.042 + 5.7, 5);
+      const n2 = N.fbm(x * 0.11 + 3.1, z * 0.11 + 9.2, 3);
+      let r = Math.hypot(dx, dz) / R + n * 0.22;          // warped coastline
+      const shape = Math.max(0, 1 - r * r);
+      let hh = 1.5 + shape * 11 + n * 6 * shape + n2 * 1.6 * shape;
+      const di = Math.hypot(x - 17, z - 86) / 13 + n * 0.3;              // small satellite islet
+      const islet = Math.max(0, 1 - di * di);
+      hh = Math.max(hh, 1.5 + islet * 9 + n2 * 1.5 * islet);
+      const dv = Math.hypot(x - VX, z - VZ);
+      const cone = 40 - dv * 1.15 + n2 * 2.2;
+      if (cone > hh - 6) hh = smax(hh, cone, 2.4);
+      if (dv < CRATER_R + 0.5) {                          // crater bowl
+        const rim = 40 - (CRATER_R + 0.5) * 1.15;
+        const bowl = CRATER_FLOOR + 0.5 + Math.pow(dv / (CRATER_R + 0.5), 2) * (rim - CRATER_FLOOR - 0.5);
+        hh = Math.min(hh, bowl);
+      }
+      h[idx(x, z)] = Math.max(1, Math.round(hh));
+    }
+
+    // ---- 2. crater lava lake
+    for (let x = 0; x < W; x++) for (let z = 0; z < W; z++) {
+      const dv = Math.hypot(x - VX, z - VZ);
+      if (dv < CRATER_R - 1.2) { h[idx(x, z)] = CRATER_FLOOR + 1; lavaCol[idx(x, z)] = 1; }
+    }
+
+    // ---- 3. lava rivers: breach the rim, then follow steepest descent to the sea
+    const riverAngles = [0.55, 2.35, 4.25];
+    for (const a0 of riverAngles) {
+      let px = VX + Math.cos(a0) * (CRATER_R - 1.5), pz = VZ + Math.sin(a0) * (CRATER_R - 1.5);
+      let dirx = Math.cos(a0), dirz = Math.sin(a0);
+      let prevH = CRATER_FLOOR + 1;
+      for (let step = 0; step < 70; step++) {
+        const cx = Math.round(px), cz = Math.round(pz);
+        if (!inb(cx, cz)) break;
+        const i = idx(cx, cz);
+        if (h[i] <= SEA - 1) break;                      // reached the sea
+        const nh = Math.min(h[i], prevH);
+        h[i] = nh; lavaCol[i] = 1; prevH = nh;
+        // widen the channel irregularly
+        if (rand() < 0.65) {
+          const sx = Math.round(cx - dirz), sz = Math.round(cz + dirx);
+          if (inb(sx, sz) && h[idx(sx, sz)] > SEA - 1) { const j = idx(sx, sz); h[j] = Math.min(h[j], nh); lavaCol[j] = 1; }
+        }
+        if (rand() < 0.35) {
+          const sx = Math.round(cx + dirz), sz = Math.round(cz - dirx);
+          if (inb(sx, sz) && h[idx(sx, sz)] > SEA - 1) { const j = idx(sx, sz); h[j] = Math.min(h[j], nh); lavaCol[j] = 1; }
+        }
+        // steepest descent sampled 2 cells ahead, blended with momentum + jitter
+        let best = Infinity, bx = dirx, bz = dirz;
+        for (let k = 0; k < 12; k++) {
+          const ang = k / 12 * Math.PI * 2;
+          const tx = Math.round(px + Math.cos(ang) * 2.2), tz = Math.round(pz + Math.sin(ang) * 2.2);
+          const hv = hAt(tx, tz) + (lavaCol[idx(Math.max(0, Math.min(W - 1, tx)), Math.max(0, Math.min(W - 1, tz)))] ? 6 : 0);
+          if (hv < best) { best = hv; bx = Math.cos(ang); bz = Math.sin(ang); }
+        }
+        const jx = (rand() - 0.5) * 0.6, jz = (rand() - 0.5) * 0.6;
+        const mw = Math.sin(step * 0.45 + a0 * 3) * 0.55;   // meander: sway across the flow direction
+        dirx = dirx * 0.5 + bx * 0.5 + jx - dirz * mw; dirz = dirz * 0.5 + bz * 0.5 + jz + dirx * mw;
+        const L = Math.hypot(dirx, dirz) || 1; dirx /= L; dirz /= L;
+        px += dirx; pz += dirz;
+      }
+    }
+
+    // ---- 4. emit voxels (only the exposed shell of each column)
+    const solids = [], lava = [], water = [];
+    let meta_temple = null;
+    const nearLava = (x, z) => {
+      for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++)
+        if ((dx || dz) && inb(x + dx, z + dz) && lavaCol[idx(x + dx, z + dz)]) return true;
+      return false;
+    };
+    const vary = (c, amt) => shade(c, 1 - amt + rand() * amt * 2);
+
+    function topColor(x, z, y, steep, lavaAdj) {
+      const n2 = N.fbm(x * 0.13 + 50, z * 0.13 + 20, 3);
+      const n3 = N.noise2(x * 0.31 + 7, z * 0.31 + 2);
+      if (lavaAdj && y >= 7) return rand() < 0.22 ? vary(0x5a2a1c, 0.1) : vary(0x2a2122, 0.12);
+      if (y <= 3) return vary(0x4f7f78, 0.08);
+      if (y <= 4) return vary(0x6c9a84, 0.08);
+      if (y <= 6) return vary(0xdccb8a, 0.06);
+      if (y <= 14) {
+        if (steep) return vary(0x7b766c, 0.1);
+        if (n2 > 0.32) return vary(0x8b6a3c, 0.1);
+        return vary(mix(0x4f8f3a, 0x86c24c, (n3 + 0.7) / 1.4), 0.08);
+      }
+      if (y <= 21) return steep ? vary(0x66625c, 0.1) : (n2 > 0.1 ? vary(0x6f7a4a, 0.1) : vary(0x7a756b, 0.1));
+      if (y <= 28) return vary(0x4a403c, 0.12);
+      return rand() < 0.15 ? vary(0x4a2e2a, 0.1) : vary(0x2f2a28, 0.12);
+    }
+    function sideColor(y) {
+      if (y <= 4) return vary(0x3e5d5a, 0.08);
+      if (y <= 7) return vary(0xb8a46e, 0.08);
+      if (y <= 16) return vary(0x6f5438, 0.1);
+      if (y <= 27) return vary(0x4e4944, 0.1);
+      return vary(0x2a2524, 0.1);
+    }
+
+    for (let x = 0; x < W; x++) for (let z = 0; z < W; z++) {
+      const i = idx(x, z), hi = h[i];
+      const nh = [hAt(x - 1, z), hAt(x + 1, z), hAt(x, z - 1), hAt(x, z + 1)];
+      const minN = Math.min(...nh), maxN = Math.max(...nh);
+      const steep = (hi - minN) >= 3 || (maxN - hi) >= 3;
+      const yStart = Math.max(0, Math.min(minN, hi - 1));
+      const top = hi - 1;
+      const lavaAdj = !lavaCol[i] && nearLava(x, z);
+      if (lavaCol[i]) {
+        const dv = Math.hypot(x - VX, z - VZ);
+        lava.push({ x, y: top, z, phase: dv * 0.45 + rand() * 1.2, crater: dv < CRATER_R });
+        for (let y = yStart; y < top; y++) solids.push({ x, y, z, c: vary(0x2a2122, 0.12) });
+      } else {
+        for (let y = yStart; y < top; y++) solids.push({ x, y, z, c: sideColor(y) });
+        solids.push({ x, y: top, z, c: topColor(x, z, top, steep, lavaAdj) });
+      }
+      // water
+      const rr = Math.hypot(x - C, z - C) / R;
+      if (hi <= SEA - 1 && rr < 1.12) {
+        // coral and weed on the shallow seabed (visible through the water)
+        if (hi >= 3 && hi <= SEA - 2 && rand() < 0.33) {
+          const reefPal = [0xff6f91, 0xff9a3c, 0xf5e663, 0x9b5de5, 0x3ddc97, 0xffb4a2];
+          const cc = reefPal[(rand() * reefPal.length) | 0];
+          solids.push({ x, y: hi, z, c: vary(cc, 0.1) });
+          if (hi <= SEA - 3 && rand() < 0.35) solids.push({ x, y: hi + 1, z, c: vary(cc, 0.1) });
+        } else if (hi < 3 && rand() < 0.05) {
+          solids.push({ x, y: hi, z, c: vary(0x3b5e5a, 0.1) });   // sunken boulder
+        }
+        const depth = (SEA - 1) - hi;                     // 0 = shallow
+        const c = mix(0x3fa8b8, 0x155a86, Math.min(1, depth / 4));
+        water.push({ x, y: SEA - 1, z, c: vary(c, 0.05), phase: rand() * 6.283 });
+      }
+    }
+
+    const reserved = new Uint8Array(W * W);   // cells no vegetation may use
+    // ---- 5b. ruined stone temple on the highest ground opposite the volcano
+    (function addTemple() {
+      let bx = 0, bz = 0, bh = -1;
+      for (let x = 8; x < W - 8; x++) for (let z = 8; z < W - 8; z++) {
+        const dv = Math.hypot(x - VX, z - VZ);
+        if (dv < 34 || Math.hypot(x - C, z - C) > R * 0.8) continue;
+        const hh = h[idx(x, z)];
+        if (hh > bh && hh <= 16) { bh = hh; bx = x; bz = z; }
+      }
+      if (bh < 8) return;
+      const STONE = 0xbdb5a6, DARK = 0x857d72, MOSS = 0x6a9a4c;
+      const base = bh; // platform level
+      // flatten a 13x13 pad and lay a 2-step stone platform
+      for (let dx = -6; dx <= 6; dx++) for (let dz = -6; dz <= 6; dz++) {
+        const x = bx + dx, z = bz + dz;
+        if (!inb(x, z)) continue;
+        const ring = Math.max(Math.abs(dx), Math.abs(dz));
+        const hh = h[idx(x, z)];
+        const padTop = base + (ring <= 4 ? 1 : 0);
+        for (let y = Math.min(hh, base - 2); y < padTop; y++) solids.push({ x, y, z, c: vary(y === padTop - 1 ? (rand() < 0.12 ? MOSS : STONE) : DARK, 0.08) });
+        h[idx(x, z)] = padTop;
+        lavaCol[idx(x, z)] = 0; reserved[idx(x, z)] = 1;
+      }
+      // pillars: 8 around the inner square, some broken
+      const cols = [[-3, -3], [0, -3], [3, -3], [-3, 0], [3, 0], [-3, 3], [0, 3], [3, 3]];
+      cols.forEach(([dx, dz], i) => {
+        const ht = (i === 1 || i === 6) ? 2 : 5 + ((rand() * 2) | 0);
+        for (let y = 0; y < ht; y++) solids.push({ x: bx + dx, y: base + 1 + y, z: bz + dz, c: vary(y === ht - 1 ? DARK : STONE, 0.07) });
+      });
+      // partial lintels along the two intact sides
+      for (let dx = -3; dx <= 3; dx++) { solids.push({ x: bx + dx, y: base + 6, z: bz - 3, c: vary(DARK, 0.06) }); if (dx !== 1) solids.push({ x: bx + dx, y: base + 6, z: bz + 3, c: vary(DARK, 0.06) }); }
+      for (let dz = -3; dz <= 3; dz++) { solids.push({ x: bx - 3, y: base + 6, z: bz + dz, c: vary(DARK, 0.06) }); }
+      // altar with a brazier flame voxel in the middle
+      solids.push({ x: bx, y: base + 1, z: bz, c: DARK }); solids.push({ x: bx, y: base + 2, z: bz, c: STONE });
+      lava.push({ x: bx, y: base + 3, z: bz, phase: 0, crater: false, brazier: true });
+      // rubble scattered on the pad
+      for (let k = 0; k < 14; k++) solids.push({ x: bx + ((rand() * 11) | 0) - 5, y: base + 1 + (rand() < 0.2 ? 1 : 0), z: bz + ((rand() * 11) | 0) - 5, c: vary(rand() < 0.3 ? MOSS : DARK, 0.1) });
+      // stone stair down the side facing the volcano
+      const sx = Math.sign(VX - bx) || 1;
+      for (let k = 1; k <= 6; k++) {
+        const x = bx + sx * (6 + k), z = bz;
+        if (!inb(x, z)) break;
+        const y = base - k;
+        for (let dz = -1; dz <= 1; dz++) { if (h[idx(x, z + dz)] < y + 1) { for (let yy = h[idx(x, z + dz)]; yy <= y; yy++) solids.push({ x, y: yy, z: z + dz, c: vary(STONE, 0.08) }); h[idx(x, z + dz)] = y + 1; } reserved[idx(x, z + dz)] = 1; }
+      }
+      meta_temple = { x: bx, y: base + 3, z: bz };
+    })();
+
+    // ---- 5. vegetation and boulders
+    function addRoundTree(x, y0, z) {
+      const th = 3 + (rand() < 0.4 ? 1 : 0);
+      for (let k = 0; k < th; k++) solids.push({ x, y: y0 + k, z, c: vary(0x5a3a22, 0.1) });
+      const base = rand() < 0.5 ? 0x3f8f3a : 0x5aa838;
+      const rad = 2 + (rand() < 0.3 ? 1 : 0);
+      for (let dx = -rad; dx <= rad; dx++) for (let dy = -rad + 1; dy <= rad; dy++) for (let dz = -rad; dz <= rad; dz++) {
+        const d = Math.hypot(dx, dy * 1.15, dz);
+        if (d <= rad + 0.15 && !(Math.abs(dx) === rad && Math.abs(dz) === rad) && rand() > 0.08)
+          solids.push({ x: x + dx, y: y0 + th + dy, z: z + dz, c: vary(mix(base, 0x9bd25a, Math.max(0, dy / rad) * 0.5), 0.1) });
+      }
+    }
+    function addPine(x, y0, z) {
+      const th = 2;
+      for (let k = 0; k < th; k++) solids.push({ x, y: y0 + k, z, c: vary(0x4a2e1c, 0.1) });
+      const layers = [2, 2, 1, 1, 0];
+      layers.forEach((rad, li) => {
+        for (let dx = -rad; dx <= rad; dx++) for (let dz = -rad; dz <= rad; dz++)
+          if (Math.abs(dx) + Math.abs(dz) <= rad + (rad > 1 ? 1 : 0))
+            solids.push({ x: x + dx, y: y0 + th + li, z: z + dz, c: vary(mix(0x215e2e, 0x3f9a4a, li / 5), 0.1) });
+      });
+    }
+    function addPalm(x, y0, z) {
+      const lx = rand() < 0.5 ? 1 : -1, lz = rand() < 0.5 ? 1 : -1;
+      let cx = x, cz = z;
+      const th = 5 + (rand() < 0.5 ? 1 : 0);
+      for (let k = 0; k < th; k++) {
+        if (k === 2) cx += lx; if (k === 4) cz += lz;
+        solids.push({ x: cx, y: y0 + k, z: cz, c: vary(0x8a6a44, 0.1) });
+      }
+      const ty = y0 + th;
+      solids.push({ x: cx, y: ty, z: cz, c: vary(0x3f9a3a, 0.1) });
+      [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]].forEach(([dx, dz], k) => {
+        const len = k < 4 ? 3 : 2;
+        for (let l = 1; l <= len; l++) solids.push({ x: cx + dx * l, y: ty - Math.floor(l / 2), z: cz + dz * l, c: vary(l === len ? 0x58b24a : 0x3a8f36, 0.1) });
+      });
+      if (rand() < 0.6) solids.push({ x: cx + 1, y: ty - 1, z: cz, c: 0x6a4a2a }); // coconut
+    }
+    function addShrub(x, y0, z) {
+      const c = rand() < 0.5 ? 0x3f8a36 : 0x5a9e3c;
+      solids.push({ x, y: y0, z, c: vary(c, 0.1) });
+      if (rand() < 0.6) solids.push({ x: x + (rand() < 0.5 ? 1 : -1), y: y0, z, c: vary(c, 0.1) });
+      if (rand() < 0.4) solids.push({ x, y: y0 + 1, z, c: vary(0x6cb446, 0.1) });
+    }
+    function addFlowers(x, y0, z) {
+      const pal = [0xff5a7a, 0xffd23a, 0xf4f0ff, 0xff8a3a];
+      solids.push({ x, y: y0, z, c: pal[(rand() * pal.length) | 0] });
+    }
+    function addBeachRock(x, y0, z) {
+      solids.push({ x, y: y0, z, c: vary(0x8c8578, 0.12) });
+      if (rand() < 0.5) solids.push({ x: x + 1, y: y0, z, c: vary(0x7c7568, 0.12) });
+    }
+    function addDeadTree(x, y0, z) {
+      const th = 3 + ((rand() * 3) | 0);
+      for (let k = 0; k < th; k++) solids.push({ x, y: y0 + k, z, c: vary(0x3a2a24, 0.12) });
+      solids.push({ x: x + 1, y: y0 + th - 1, z, c: vary(0x3a2a24, 0.12) });
+      solids.push({ x: x - 1, y: y0 + th, z: z + 1, c: vary(0x3a2a24, 0.12) });
+    }
+    function addBoulder(x, y0, z) {
+      const c = vary(0x5e5a55, 0.1);
+      for (let dx = 0; dx < 2; dx++) for (let dy = 0; dy < 2; dy++) for (let dz = 0; dz < 2; dz++)
+        if (rand() > 0.15) solids.push({ x: x + dx, y: y0 + dy, z: z + dz, c: shade(c, 1 - dy * 0.1) });
+    }
+    for (let x = 2; x < W - 2; x++) for (let z = 2; z < W - 2; z++) {
+      const i = idx(x, z), hi = h[i], top = hi - 1;
+      if (lavaCol[i] || reserved[i] || nearLava(x, z)) continue;
+      const dv = Math.hypot(x - VX, z - VZ);
+      const nh = [hAt(x - 1, z), hAt(x + 1, z), hAt(x, z - 1), hAt(x, z + 1)];
+      if (Math.max(...nh) - Math.min(...nh) >= 3) continue;   // too steep
+      if (top >= 7 && top <= 14 && dv > 15) {
+        const roll = rand();
+        if (roll < 0.05) addRoundTree(x, hi, z);
+        else if (roll < 0.074) addPine(x, hi, z);
+        else if (roll < 0.125) addShrub(x, hi, z);
+        else if (roll < 0.14) addFlowers(x, hi, z);
+      } else if (top >= 5 && top <= 6) {
+        const roll = rand();
+        if (roll < 0.03) addPalm(x, hi, z);
+        else if (roll < 0.05) addBeachRock(x, hi, z);
+      } else if (top >= 15 && top <= 26 && dv > 10) {
+        const roll = rand();
+        if (roll < 0.025) addBoulder(x, hi, z);
+        else if (roll < 0.05) addDeadTree(x, hi, z);
+      }
+    }
+
+    // ---- 5c. secondary vents: small glowing fissures on the upper slope
+    for (let k = 0; k < 4; k++) {
+      const a = k * 1.6 + 0.9, d = 12 + rand() * 6;
+      const vx = Math.round(VX + Math.cos(a) * d), vz = Math.round(VZ + Math.sin(a) * d);
+      for (let j = 0; j < 3; j++) {
+        const x = vx + j * Math.round(Math.cos(a + 1.5)), z = vz + j * Math.round(Math.sin(a + 1.5));
+        if (!inb(x, z) || lavaCol[idx(x, z)]) continue;
+        const i = idx(x, z);
+        lavaCol[i] = 1;
+        lava.push({ x, y: h[i], z, phase: rand() * 3, crater: false, vent: true });
+      }
+    }
+
+    // ---- 6. clouds (voxel puffs, drift in render)
+    const clouds = [];
+    for (let k = 0; k < 6; k++) {
+      const cx = rand() * 150 - 20, cz = rand() * 150 - 20, cy = 66 + rand() * 12;
+      const len = 7 + Math.floor(rand() * 7), wid = 3 + Math.floor(rand() * 3);
+      for (let dx = -len; dx <= len; dx++) for (let dz = -wid; dz <= wid; dz++) {
+        const e = (dx / len) ** 2 + (dz / wid) ** 2 + N.noise2(cx + dx * 0.5, cz + dz * 0.5) * 0.35;
+        if (e < 0.9) {
+          const tall = e < 0.35 ? 2 : 1;
+          for (let dy = 0; dy < tall; dy++) clouds.push({ x: cx + dx, y: cy + dy, z: cz + dz, c: dy ? 0xffffff : 0xe3e8f2 });
+        }
+      }
+    }
+
+    return { solids, lava, water, clouds, meta: { W, C, R, SEA, VX, VZ, CRATER_R, CRATER_FLOOR, temple: meta_temple } };
+  }
+
+  // Phoenix body plan, modelled at half-voxel resolution (the renderer scales it by 0.5).
+  // Local frame: +X forward, +Y up, +Z to the bird's right. Every voxel is tagged by part
+  // so the animation can articulate it: wings fold about a shoulder hinge and a wrist hinge,
+  // tail streamers and crest plumes wave along their length, flame-tagged voxels flicker.
+  function buildPhoenix() {
+    const cells = new Map();
+    const put = (x, y, z, c, part, extra) => {
+      x = Math.round(x); y = Math.round(y); z = Math.round(z);
+      cells.set(x + ',' + y + ',' + z, Object.assign({ x, y, z, c, part, span: 0, u: 0, side: 0, flame: false, phase: 0 }, extra || {}));
+    };
+    const clamp01 = t => Math.max(0, Math.min(1, t));
+    const grad = (stops, t) => {                          // piecewise colour gradient over [0,1]
+      t = clamp01(t); const n = stops.length - 1; const i = Math.min(n - 1, Math.floor(t * n));
+      return mix(stops[i], stops[i + 1], t * n - i);
+    };
+    const GOLD = 0xffd45a, AMBER = 0xffa629, ORANGE = 0xff7a1c, RED = 0xf03a12, CRIMSON = 0xb5160c, EMBER = 0x6a1008, FLAME = 0xfff2a0, DARK = 0x1a0a0a, CREAM = 0xffe9b0;
+    const sphere = (cx, cy, cz, rx, ry, rz, colFn, part, extra) => {
+      for (let x = Math.floor(cx - rx); x <= Math.ceil(cx + rx); x++) for (let y = Math.floor(cy - ry); y <= Math.ceil(cy + ry); y++) for (let z = Math.floor(cz - rz); z <= Math.ceil(cz + rz); z++) {
+        const d = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 + ((z - cz) / rz) ** 2;
+        if (d <= 1.0) put(x, y, z, colFn(x, y, z), part, extra);
+      }
+    };
+
+    // ---- torso: tapered ellipsoid, back is red-orange, belly amber, chest gold
+    const torsoCol = (x, y, z) => {
+      const back = clamp01((y + 1) / 5), front = clamp01((x + 4) / 12);
+      let c = mix(grad([GOLD, AMBER, ORANGE], 0.55 - front * 0.3 + back * 0.4), grad([ORANGE, RED], back), back * 0.8);
+      if (((x + 20) % 4 === 0) && y > 1) c = shade(c, 0.9);                 // faint feather banding on the back
+      return c;
+    };
+    for (let x = -11; x <= 9; x++) {
+      const t = (x - 1) / 11;
+      const r = 5.0 * Math.sqrt(Math.max(0, 1 - t * t)) * (x < -6 ? 0.85 : 1);
+      sphere(x, 0.3 - Math.max(0, t) * 1.2, 0, 0.8, r * 0.95, r * 0.9, torsoCol, 'body');
+    }
+    // ---- neck: S-curve of shrinking spheres up to the head
+    for (let i = 0; i <= 14; i++) {
+      const u = i / 14;
+      const nx = 7 + u * 7.5, ny = 1.5 + u * u * 7.5 + Math.sin(u * Math.PI) * 1.2;
+      const r = 2.8 - u * 0.7;
+      sphere(nx, ny, 0, r * 0.9, r, r * 0.9, (x, y) => mix(AMBER, ORANGE, clamp01((y - ny + r) / (2 * r))), 'body');
+    }
+    // ---- head, eyes, beak
+    sphere(16.5, 9.6, 0, 3.6, 3.1, 2.9, (x, y) => mix(GOLD, ORANGE, clamp01((y - 7) / 6)), 'body');
+    for (const sz of [-1, 1]) { put(18, 10.5, sz * 3, DARK, 'body'); put(18, 11.5, sz * 3, CREAM, 'body'); put(17, 10.5, sz * 3, CREAM, 'body'); }
+    for (let i = 0; i <= 7; i++) {
+      const u = i / 7, bx = 19.5 + u * 5.5, by = 9.2 - u * 1.6 - (u > 0.75 ? (u - 0.75) * 5 : 0), r = 1.5 - u * 1.0;
+      sphere(bx, by, 0, 0.9, Math.max(0.5, r), Math.max(0.5, r), () => grad([GOLD, AMBER, EMBER], u), 'body');
+    }
+    // ---- crest: five plumes sweeping back off the crown, flame-tipped
+    for (let k = 0; k < 5; k++) {
+      const L = 9 + (k === 2 ? 4 : (k === 1 || k === 3 ? 2 : 0)), zz = (k - 2) * 1.4, lift = 1 - Math.abs(k - 2) * 0.25;
+      for (let i = 0; i <= L; i++) {
+        const u = i / L;
+        const x = 16 - u * L * 0.95, y = 12 + u * 7 * lift - u * u * 5, z = zz * (1 + u * 0.8);
+        put(x, y, z, grad([RED, ORANGE, GOLD, FLAME], u), 'crest', { u, flame: u > 0.8, phase: k * 1.3 });
+        if (u < 0.5) put(x, y - 1, z, grad([CRIMSON, RED], u * 2), 'crest', { u });
+      }
+    }
+    // ---- wings: shoulder at z=±4, wrist at span 10, tip at span 26
+    const SPAN = 26, WRIST = 10;
+    const leadX = sp => sp <= WRIST ? 3 + sp * 0.28 : 5.8 - (sp - WRIST) * 0.32;        // leading-edge x along the span
+    const chord = sp => sp <= WRIST ? 9 + sp * 0.35 : 12.5 - (sp - WRIST) * 0.55;       // depth of the solid feather surface
+    for (const side of [-1, 1]) {
+      for (let sp = 0; sp <= SPAN; sp++) {
+        const z = side * (4 + sp), xl = leadX(sp), ch = chord(sp);
+        const notch = (sp % 3 === 0) ? 1.5 : (sp % 3 === 1 ? 0.5 : 0);                 // scalloped trailing edge
+        const thick = sp < 7 ? 3 : 2;
+        for (let k = 0; k < ch - notch; k++) {
+          const tc = k / ch;                                                             // 0 leading edge → 1 trailing
+          let c = grad([GOLD, AMBER, ORANGE, RED, CRIMSON], tc * 0.95 + sp / SPAN * 0.12);
+          if (sp % 2 === 1) c = shade(c, 0.92);                                          // barb lines
+          if (k === 0) c = mix(c, CREAM, 0.35);                                          // bright leading edge
+          for (let dy = 0; dy < thick; dy++) put(xl - k, 1 + dy, z, c, 'wing', { span: sp, side });
+        }
+        // trailing-edge ember sparks between the scallops
+        if (sp % 3 === 0 && sp > 2) put(xl - (ch - notch) - 1, 1, z, FLAME, 'wing', { span: sp, side, flame: true, phase: sp * 0.7 });
+      }
+      // primaries: nine long finger feathers fanning back from the hand
+      for (let k = 0; k < 9; k++) {
+        const sp0 = WRIST + 1 + k * 1.8, L = 8 + k * 1.1 + (k > 6 ? (8 - k) * 1.5 : 0);
+        const th = 0.12 + k * 0.1;                                                       // fan angle, outermost sweeps furthest back
+        const ox = leadX(sp0) - chord(sp0) + 2, oz = 4 + sp0;
+        for (let i = 0; i <= L; i++) {
+          const u = i / L;
+          const x = ox - Math.cos(th) * i, zz = oz + Math.sin(th) * i;
+          const w = u < 0.15 ? 1 : (u < 0.85 ? 1 : 0);                                   // narrow at the tip
+          const c = grad([ORANGE, RED, CRIMSON, EMBER, FLAME], u);
+          const py = 1 - u * u * 2.5;                                                    // feathers droop toward the tips
+          put(x, py, side * zz, c, 'wing', { span: zz - 4, side, flame: u > 0.88, phase: k * 0.9 + 2 });
+          if (w) put(x - 1, py, side * zz, shade(c, 0.85), 'wing', { span: zz - 4, side, flame: u > 0.88, phase: k * 0.9 + 2 });
+          if (u < 0.45) { put(x, py + 1, side * zz, shade(c, 0.9), 'wing', { span: zz - 4, side }); if (w) put(x - 1, py + 1, side * zz, shade(c, 0.8), 'wing', { span: zz - 4, side }); }
+        }
+      }
+    }
+    // ---- tail: five streamers that fan out, droop and end in teardrop flames
+    for (let k = -2; k <= 2; k++) {
+      const L = 24 - Math.abs(k) * 4, z0 = k * 2.2;
+      for (let i = 0; i <= L; i++) {
+        const u = i / L;
+        const x = -9 - i, y = -0.5 - u * 3.5 - u * u * 2 + (k === 0 ? 0.5 : 0), z = z0 * (1 + u * 2.4);
+        const r = u < 0.1 ? 1.4 : (u < 0.8 ? 0.9 : 1.1 + (u - 0.8) * 7);                // teardrop tip
+        const c = grad([AMBER, ORANGE, RED, CRIMSON, GOLD, FLAME], u);
+        sphere(x, y, z, 0.6, r, r, () => c, 'tail', { u, flame: u > 0.85, phase: k * 1.1 + 5 });
+      }
+    }
+    // short upper tail coverts
+    for (let i = 0; i < 6; i++) for (const zz of [-3, -1, 1, 3]) put(-10 - i, 1 - i * 0.25, zz * (1 + i * 0.12), grad([ORANGE, RED], i / 6), 'tail', { u: i / 20 });
+    // ---- legs tucked under the belly with forward talons
+    for (const sz of [-1, 1]) {
+      for (let i = 0; i < 3; i++) put(1 - i * 0.3, -4.5 - i, sz * 2.2, i === 2 ? AMBER : GOLD, 'body');
+      put(2, -6.5, sz * 2.2, DARK, 'body'); put(3, -6.5, sz * 2.2, DARK, 'body'); put(0, -6.5, sz * 2.2, DARK, 'body');
+    }
+
+    // ---- shell filter + baked shading so the form reads under an unlit material
+    const has = (x, y, z) => cells.has(x + ',' + y + ',' + z);
+    const out = [];
+    for (const v of cells.values()) {
+      const up = has(v.x, v.y + 1, v.z), down = has(v.x, v.y - 1, v.z);
+      const sides = has(v.x + 1, v.y, v.z) && has(v.x - 1, v.y, v.z) && has(v.x, v.y, v.z + 1) && has(v.x, v.y, v.z - 1);
+      if (up && down && sides) continue;                                               // fully enclosed → invisible
+      let k = 1;
+      if (!up) k *= 1.06; if (!down && up) k *= 0.6; if (!down && !up) k *= 0.93;
+      if (!has(v.x + 1, v.y, v.z)) k *= 1.03;                                          // forward faces catch the sun
+      v.c = shade(v.c, k);
+      out.push(v);
+    }
+    return out;
+  }
+
+  return { build, buildPhoenix, W, SEA };
+})();
+</script>
+
+<!-- ============================================================
+     RENDERER — Three.js (ES modules via import map)
+     ============================================================ -->
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const canvas = document.getElementById('c');
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && window.innerWidth < 1100);
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !isMobile, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, isMobile ? 1.5 : 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, 1, 0.5, 900);
+
+// ---------- world data ----------
+const world = VoxelGen.build(20261101);
+const phoenixVox = VoxelGen.buildPhoenix();
+const M = world.meta;
+const centre = new THREE.Vector3(M.C, 10, M.C);
+const craterPos = new THREE.Vector3(M.VX, M.CRATER_FLOOR + 1, M.VZ);
+
+const EMBERS = 260, TRAIL = 320, SMOKE = 140, SPARKS = 90;
+const totalVoxels = world.solids.length + world.lava.length + world.water.length + world.clouds.length + phoenixVox.length + EMBERS + TRAIL + SMOKE + SPARKS;
+document.getElementById('vc').textContent = totalVoxels.toLocaleString();
+
+// ---------- sky dome (gradient shader) ----------
+const skyUniforms = {
+  top: { value: new THREE.Color(0x4a78b8) }, mid: { value: new THREE.Color(0xf0a574) }, bot: { value: new THREE.Color(0x2b1a2a) },
+  sun: { value: new THREE.Vector3(0.55, 0.35, -0.75).normalize() }, sunCol: { value: new THREE.Color(0xffd9a0) }, stars: { value: 0 }
+};
+const sky = new THREE.Mesh(new THREE.SphereGeometry(500, 24, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false, uniforms: skyUniforms,
+  vertexShader: `varying vec3 vW; void main(){ vW = (modelMatrix*vec4(position,1.0)).xyz; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform vec3 top, mid, bot, sun, sunCol; uniform float stars; varying vec3 vW;
+    float hash(vec3 p){ p=fract(p*0.3183099+vec3(0.1,0.2,0.3)); p*=17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+    void main(){
+      vec3 d = normalize(vW - cameraPosition);
+      float h = d.y;
+      vec3 c = h > 0.0 ? mix(mid, top, pow(clamp(h,0.0,1.0),0.55)) : mix(mid, bot, clamp(-h*3.0,0.0,1.0));
+      float sd = max(dot(d, sun), 0.0);
+      c += sunCol * (pow(sd, 40.0)*0.9 + pow(sd, 6.0)*0.25);
+      // stars (night only)
+      vec3 g = floor(d*220.0);
+      float s = step(0.9985, hash(g)) * stars * clamp(h*2.0,0.0,1.0);
+      c += vec3(s);
+      gl_FragColor = vec4(c, 1.0);
+    }`
+}));
+scene.add(sky);
+scene.fog = new THREE.Fog(0xe0a883, 140, 420);
+
+// ---------- lights ----------
+const hemi = new THREE.HemisphereLight(0x9fc3e6, 0x4a3324, 0.6); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffe2b8, 2.2);
+sun.position.set(M.C + 70, 90, M.C - 95);
+sun.target.position.copy(new THREE.Vector3(M.C, 8, M.C)); scene.add(sun.target);
+sun.castShadow = true;
+sun.shadow.mapSize.set(isMobile ? 1024 : 2048, isMobile ? 1024 : 2048);
+sun.shadow.camera.near = 20; sun.shadow.camera.far = 320;
+sun.shadow.camera.left = -78; sun.shadow.camera.right = 78; sun.shadow.camera.top = 78; sun.shadow.camera.bottom = -78;
+sun.shadow.bias = -0.0006; sun.shadow.normalBias = 0.02;
+scene.add(sun);
+const lavaLight = new THREE.PointLight(0xff6a1a, 420, 70, 2); lavaLight.position.set(M.VX, M.CRATER_FLOOR + 5, M.VZ); scene.add(lavaLight);
+const phoenixLight = new THREE.PointLight(0xffa040, 260, 45, 2); scene.add(phoenixLight);
+
+// ---------- helpers ----------
+const box = new THREE.BoxGeometry(1, 1, 1);
+const dummy = new THREE.Object3D();
+const tmpM = new THREE.Matrix4();
+const tmpC = new THREE.Color();
+const tmpV = new THREE.Vector3();
+
+function makeStatic(list, material, { shadow = true, yScale = 1, offset = 0 } = {}) {
+  const mesh = new THREE.InstancedMesh(box, material, list.length);
+  for (let i = 0; i < list.length; i++) {
+    const v = list[i];
+    dummy.position.set(v.x, v.y + offset, v.z); dummy.scale.set(1, yScale, 1); dummy.rotation.set(0, 0, 0); dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    mesh.setColorAt(i, tmpC.setHex(v.c));
+  }
+  mesh.instanceMatrix.needsUpdate = true; mesh.instanceColor.needsUpdate = true;
+  mesh.castShadow = shadow; mesh.receiveShadow = shadow;
+  mesh.computeBoundingSphere();
+  scene.add(mesh);
+  return mesh;
+}
+
+// ---------- terrain ----------
+const terrain = makeStatic(world.solids, new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0.0 }));
+
+// ---------- ocean: voxel surface + infinite plane under it ----------
+const waterMat = new THREE.MeshStandardMaterial({ roughness: 0.25, metalness: 0.15, transparent: true, opacity: 0.82 });
+const water = makeStatic(world.water, waterMat, { shadow: false, yScale: 0.55, offset: 0.1 });
+water.receiveShadow = true;
+const oceanPlane = new THREE.Mesh(new THREE.PlaneGeometry(1400, 1400), new THREE.MeshStandardMaterial({ color: 0x1b6b92, roughness: 0.35, metalness: 0.15 }));
+oceanPlane.rotation.x = -Math.PI / 2; oceanPlane.position.set(M.C, M.SEA - 1 - 0.1, M.C); oceanPlane.receiveShadow = true;
+scene.add(oceanPlane);
+const waterBase = world.water.map(v => v.c);
+
+// ---------- lava (unlit, over-bright so bloom catches it) ----------
+const lavaMat = new THREE.MeshBasicMaterial({ toneMapped: true });
+const lava = new THREE.InstancedMesh(box, lavaMat, world.lava.length);
+for (let i = 0; i < world.lava.length; i++) {
+  const v = world.lava[i];
+  const ys = v.vent ? 0.3 : (v.brazier ? 0.6 : (v.crater ? 0.92 : 1));
+  const yo = v.vent ? -0.35 : (v.brazier ? -0.2 : (v.crater ? -0.05 : 0));
+  dummy.position.set(v.x, v.y + yo, v.z); dummy.scale.set(v.vent ? 0.9 : (v.brazier ? 0.6 : 1), ys, v.vent ? 0.9 : (v.brazier ? 0.6 : 1)); dummy.rotation.set(0, 0, 0); dummy.updateMatrix();
+  lava.setMatrixAt(i, dummy.matrix); lava.setColorAt(i, tmpC.setRGB(1, 0.4, 0.05));
+}
+lava.instanceMatrix.needsUpdate = true; lava.castShadow = false; lava.receiveShadow = false; lava.computeBoundingSphere();
+scene.add(lava);
+const LAVA_DARK = new THREE.Color(1.05, 0.2, 0.02), LAVA_HOT = new THREE.Color(1.5, 0.75, 0.12), LAVA_CRUST = new THREE.Color(0.4, 0.09, 0.03);
+
+// ---------- clouds ----------
+const cloudMat = new THREE.MeshStandardMaterial({ roughness: 1, transparent: true, opacity: 0.86 });
+const clouds = makeStatic(world.clouds, cloudMat, { shadow: false });
+clouds.castShadow = true; clouds.frustumCulled = false;
+const cloudBase = world.clouds.map(v => [v.x, v.y, v.z]);
+
+// ---------- phoenix ----------
+const phoenixMat = new THREE.MeshBasicMaterial({ toneMapped: true });
+const phoenix = new THREE.InstancedMesh(box, phoenixMat, phoenixVox.length);
+phoenix.frustumCulled = false; phoenix.castShadow = true;
+const flameIdx = [];
+for (let i = 0; i < phoenixVox.length; i++) {
+  tmpC.setHex(phoenixVox[i].c).multiplyScalar(1.0);
+  phoenix.setColorAt(i, tmpC);
+  if (phoenixVox[i].flame) flameIdx.push(i);
+}
+phoenix.instanceColor.needsUpdate = true;
+scene.add(phoenix);
+const birdM = new THREE.Matrix4(), birdQ = new THREE.Quaternion(), birdPos = new THREE.Vector3(), birdEuler = new THREE.Euler();
+const bankQ = new THREE.Quaternion(), pitchQ = new THREE.Quaternion(), AX_X = new THREE.Vector3(1, 0, 0), AX_Z = new THREE.Vector3(0, 0, 1);
+const PH_SCALE = 0.55;                       // bird is modelled at half-voxel resolution
+const birdScale = new THREE.Vector3(PH_SCALE, PH_SCALE, PH_SCALE);
+const FLAME_A = new THREE.Color(1.6, 0.35, 0.05), FLAME_B = new THREE.Color(1.9, 1.5, 0.6);
+const WING_ROOT = 4, WING_WRIST = 10, WING_SPAN = 26;
+
+// ---------- particle systems (embers, phoenix trail, smoke, sparks) ----------
+function makeParticles(count, material, size) {
+  const mesh = new THREE.InstancedMesh(box, material, count);
+  mesh.frustumCulled = false; mesh.castShadow = false; mesh.receiveShadow = false;
+  const P = { mesh, count, size, pos: new Float32Array(count * 3), vel: new Float32Array(count * 3), life: new Float32Array(count), max: new Float32Array(count), next: 0 };
+  for (let i = 0; i < count; i++) { P.life[i] = -1; dummy.position.set(0, -50, 0); dummy.scale.set(0.001, 0.001, 0.001); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix); mesh.setColorAt(i, tmpC.setRGB(0, 0, 0)); }
+  scene.add(mesh); return P;
+}
+const embers = makeParticles(EMBERS, new THREE.MeshBasicMaterial(), 0.38);
+const trail = makeParticles(TRAIL, new THREE.MeshBasicMaterial(), 0.32);
+const smoke = makeParticles(SMOKE, new THREE.MeshStandardMaterial({ transparent: true, opacity: 0.42, roughness: 1, depthWrite: false }), 2.2);
+const sparks = makeParticles(SPARKS, new THREE.MeshBasicMaterial(), 0.3);
+
+function spawn(P, x, y, z, vx, vy, vz, life) {
+  const i = P.next; P.next = (P.next + 1) % P.count;
+  P.pos[i * 3] = x; P.pos[i * 3 + 1] = y; P.pos[i * 3 + 2] = z;
+  P.vel[i * 3] = vx; P.vel[i * 3 + 1] = vy; P.vel[i * 3 + 2] = vz;
+  P.life[i] = life; P.max[i] = life;
+}
+function stepParticles(P, dt, colorFn, scaleFn, accel) {
+  for (let i = 0; i < P.count; i++) {
+    if (P.life[i] <= 0) continue;
+    P.life[i] -= dt;
+    const i3 = i * 3;
+    P.vel[i3] += accel[0] * dt; P.vel[i3 + 1] += accel[1] * dt; P.vel[i3 + 2] += accel[2] * dt;
+    P.pos[i3] += P.vel[i3] * dt; P.pos[i3 + 1] += P.vel[i3 + 1] * dt; P.pos[i3 + 2] += P.vel[i3 + 2] * dt;
+    const t = Math.max(0, P.life[i] / P.max[i]);       // 1 = fresh, 0 = dead
+    const s = P.life[i] > 0 ? scaleFn(t) * P.size : 0.0001;
+    dummy.position.set(P.pos[i3], P.pos[i3 + 1], P.pos[i3 + 2]); dummy.scale.set(s, s, s); dummy.rotation.set(0, 0, 0); dummy.updateMatrix();
+    P.mesh.setMatrixAt(i, dummy.matrix);
+    P.mesh.setColorAt(i, colorFn(t, tmpC));
+  }
+  P.mesh.instanceMatrix.needsUpdate = true; P.mesh.instanceColor.needsUpdate = true;
+}
+const emberCol = (t, c) => c.setRGB(1.5 * t + 0.4, 0.9 * t * t, 0.1 * t * t * t);
+const trailCol = (t, c) => c.setRGB(0.6 + 0.8 * t, 0.1 + 0.6 * t * t, 0.02 + 0.15 * t * t * t);
+const smokeCol = (t, c) => { const k = 0.18 + 0.3 * (1 - t); return c.setRGB(k, k * 0.95, k * 0.92); };
+const sparkCol = (t, c) => c.setRGB(1.8, 1.1 * t + 0.3, 0.2 * t);
+
+// ---------- post-processing ----------
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.45, 0.35, 0.95);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---------- camera orbit controller (mouse / touch / keyboard) ----------
+const cam = {
+  target: centre.clone(), theta: 0.75, phi: 1.12, radius: isMobile ? 150 : 100,
+  dTheta: 0.75, dPhi: 1.12, dRadius: isMobile ? 150 : 100, dTarget: centre.clone(), follow: 0,
+  autoRotate: true, idle: 0, minR: 14, maxR: 280
+};
+const templePos = M.temple ? new THREE.Vector3(M.temple.x, M.temple.y, M.temple.z) : centre.clone();
+const FOCUS = [
+  { name: 'island', target: () => centre, phi: 1.12, radius: isMobile ? 150 : 100 },
+  { name: 'crater', target: () => craterPos, phi: 0.8, radius: 50 },
+  { name: 'temple', target: () => templePos, phi: 0.78, radius: 42 },
+  { name: 'phoenix', target: () => birdPos, phi: 1.2, radius: 26, follow: true },
+];
+function resetView() { setFocus(0); cam.dTheta = 0.75; }
+function setFocus(i) {
+  cam.follow = i;
+  const f = FOCUS[i];
+  cam.dPhi = f.phi; cam.dRadius = f.radius; cam.dTarget.copy(f.target());
+  document.getElementById('bFocus').querySelector('small').textContent = f.name;
+}
+function clampCam() {
+  cam.dPhi = Math.max(0.12, Math.min(1.52, cam.dPhi));
+  cam.dRadius = Math.max(cam.minR, Math.min(cam.maxR, cam.dRadius));
+  cam.dTarget.x = Math.max(-20, Math.min(M.W + 20, cam.dTarget.x));
+  cam.dTarget.z = Math.max(-20, Math.min(M.W + 20, cam.dTarget.z));
+  cam.dTarget.y = Math.max(2, Math.min(60, cam.dTarget.y));
+}
+function userInput() { cam.idle = 0; document.getElementById('hint').style.opacity = 0.25; }
+
+const pointers = new Map();
+let pinchDist = 0, pinchMid = { x: 0, y: 0 };
+canvas.addEventListener('pointerdown', e => {
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* synthetic or already-released pointer */ }
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button });
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    pinchDist = Math.hypot(a.x - b.x, a.y - b.y); pinchMid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+  userInput();
+});
+canvas.addEventListener('pointermove', e => {
+  if (!pointers.has(e.pointerId)) return;
+  const prev = pointers.get(e.pointerId);
+  const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+  prev.x = e.clientX; prev.y = e.clientY;
+  if (pointers.size === 1) {
+    if (prev.button === 2 || e.shiftKey) panBy(dx, dy);
+    else { cam.dTheta -= dx * 0.0055; cam.dPhi -= dy * 0.0055; }
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    if (pinchDist > 0) cam.dRadius *= pinchDist / d;
+    panBy(mid.x - pinchMid.x, mid.y - pinchMid.y);
+    pinchDist = d; pinchMid = mid;
+  }
+  clampCam(); userInput();
+});
+const endPointer = e => { pointers.delete(e.pointerId); pinchDist = 0; };
+canvas.addEventListener('pointerup', endPointer); canvas.addEventListener('pointercancel', endPointer); canvas.addEventListener('pointerleave', endPointer);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dRadius *= 1 + Math.sign(e.deltaY) * 0.09; clampCam(); userInput(); }, { passive: false });
+canvas.addEventListener('dblclick', () => { resetView(); userInput(); });
+
+const camRight = new THREE.Vector3(), camUp = new THREE.Vector3();
+function panBy(dx, dy) {
+  if (FOCUS[cam.follow].follow) { cam.follow = 0; document.getElementById('bFocus').querySelector('small').textContent = 'island'; }
+  const k = cam.dRadius * 0.0016;
+  camera.matrixWorld.extractBasis(camRight, camUp, tmpV);
+  camUp.set(0, 1, 0);
+  camRight.y = 0; camRight.normalize();
+  cam.dTarget.addScaledVector(camRight, -dx * k).addScaledVector(camUp, dy * k);
+}
+
+const keys = new Set();
+window.addEventListener('keydown', e => {
+  keys.add(e.key.toLowerCase());
+  if (e.key.toLowerCase() === 'n') toggleNight();
+  if (e.key.toLowerCase() === 'r') resetView();
+  if (e.key.toLowerCase() === 'f') setFocus((cam.follow + 1) % FOCUS.length);
+  if (e.key === ' ') { toggleRotate(); e.preventDefault(); }
+  userInput();
+});
+window.addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+
+function toggleRotate() { cam.autoRotate = !cam.autoRotate; document.getElementById('bRot').classList.toggle('on', cam.autoRotate); }
+let night = false, nightT = 0;
+function toggleNight() { night = !night; document.getElementById('bNight').classList.toggle('on', night); }
+const hold = (id, fn) => {
+  const el = document.getElementById(id); let timer = null;
+  const start = e => { e.preventDefault(); fn(); timer = setInterval(fn, 60); userInput(); };
+  const stop = () => { clearInterval(timer); timer = null; };
+  el.addEventListener('pointerdown', start); el.addEventListener('pointerup', stop); el.addEventListener('pointerleave', stop); el.addEventListener('pointercancel', stop);
+};
+hold('bIn', () => { cam.dRadius *= 0.97; clampCam(); });
+hold('bOut', () => { cam.dRadius *= 1.03; clampCam(); });
+document.getElementById('bRot').addEventListener('click', toggleRotate);
+document.getElementById('bNight').addEventListener('click', toggleNight);
+document.getElementById('bReset').addEventListener('click', () => { resetView(); userInput(); });
+document.getElementById('bFocus').addEventListener('click', () => { setFocus((cam.follow + 1) % FOCUS.length); userInput(); });
+
+// ---------- resize ----------
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false); composer.setSize(w, h);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+// ---------- day / night palettes ----------
+const DAY = { top: new THREE.Color(0x4a78b8), mid: new THREE.Color(0xf0a574), bot: new THREE.Color(0x2b1a2a), fog: new THREE.Color(0xe0a883), sunCol: new THREE.Color(0xffd9a0), sun: 2.2, hemi: 0.6, bloom: 0.45, lavaL: 420, expo: 1.05 };
+const NIGHT = { top: new THREE.Color(0x050a1c), mid: new THREE.Color(0x1a1f3a), bot: new THREE.Color(0x05050a), fog: new THREE.Color(0x0d1020), sunCol: new THREE.Color(0x3b4a7a), sun: 0.12, hemi: 0.1, bloom: 0.6, lavaL: 900, expo: 1.0 };
+const sunDayPos = sun.position.clone();
+
+// ---------- animation loop ----------
+const clock = new THREE.Clock();
+let fpsN = 0, fpsT = performance.now();
+const fpsEl = document.getElementById('fps');
+const lavaCount = world.lava.length;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const rawDt = Math.min(clock.getDelta(), 1);
+  const dt = Math.min(rawDt, 0.05);
+  const t = clock.elapsedTime;
+
+  // --- keyboard orbit
+  const rs = 1.6 * dt, zs = 1 + 0.9 * dt;
+  if (keys.has('a') || keys.has('arrowleft')) cam.dTheta -= rs;
+  if (keys.has('d') || keys.has('arrowright')) cam.dTheta += rs;
+  if (keys.has('w') || keys.has('arrowup')) cam.dPhi -= rs * 0.6;
+  if (keys.has('s') || keys.has('arrowdown')) cam.dPhi += rs * 0.6;
+  if (keys.has('q') || keys.has('-') || keys.has('_')) cam.dRadius *= zs;
+  if (keys.has('e') || keys.has('=') || keys.has('+')) cam.dRadius /= zs;
+  if (keys.size) clampCam();
+
+  // --- auto-orbit after idle
+  cam.idle += dt;
+  if (cam.autoRotate && cam.idle > 4) cam.dTheta += 0.07 * dt;
+
+  // --- smooth camera (follow mode keeps the target on the phoenix)
+  if (FOCUS[cam.follow].follow) { cam.dTarget.copy(birdPos); cam.target.copy(birdPos); }
+  const k = 1 - Math.exp(-dt * 8);
+  cam.theta += (cam.dTheta - cam.theta) * k; cam.phi += (cam.dPhi - cam.phi) * k; cam.radius += (cam.dRadius - cam.radius) * k;
+  cam.target.lerp(cam.dTarget, k);
+  camera.position.set(
+    cam.target.x + cam.radius * Math.sin(cam.phi) * Math.cos(cam.theta),
+    cam.target.y + cam.radius * Math.cos(cam.phi),
+    cam.target.z + cam.radius * Math.sin(cam.phi) * Math.sin(cam.theta));
+  camera.lookAt(cam.target);
+  sky.position.copy(camera.position);
+
+  // --- day/night blend
+  nightT += ((night ? 1 : 0) - nightT) * (1 - Math.exp(-rawDt * 1.6));
+  const L = (a, b) => a + (b - a) * nightT;
+  skyUniforms.top.value.lerpColors(DAY.top, NIGHT.top, nightT);
+  skyUniforms.mid.value.lerpColors(DAY.mid, NIGHT.mid, nightT);
+  skyUniforms.bot.value.lerpColors(DAY.bot, NIGHT.bot, nightT);
+  skyUniforms.sunCol.value.lerpColors(DAY.sunCol, NIGHT.sunCol, nightT);
+  skyUniforms.stars.value = nightT;
+  scene.fog.color.lerpColors(DAY.fog, NIGHT.fog, nightT);
+  sun.intensity = L(DAY.sun, NIGHT.sun); hemi.intensity = L(DAY.hemi, NIGHT.hemi);
+  bloom.strength = L(DAY.bloom, NIGHT.bloom); renderer.toneMappingExposure = L(DAY.expo, NIGHT.expo);
+  sun.position.copy(sunDayPos).y = L(90, 55);
+
+  // --- lava pulse (crust/hot cycling per voxel)
+  const flick = 0.85 + 0.15 * Math.sin(t * 7.3) * Math.sin(t * 3.1);
+  lavaLight.intensity = L(DAY.lavaL, NIGHT.lavaL) * flick;
+  lavaLight.position.y = M.CRATER_FLOOR + 4 + Math.sin(t * 2.1) * 0.4;
+  for (let i = 0; i < lavaCount; i++) {
+    const v = world.lava[i];
+    const w = 0.5 + 0.5 * Math.sin(t * 1.7 - v.phase) ;
+    const w2 = 0.5 + 0.5 * Math.sin(t * 0.9 + v.phase * 2.3);
+    tmpC.lerpColors(LAVA_DARK, LAVA_HOT, w * w);
+    if (v.crater) tmpC.multiplyScalar(0.75 + 0.2 * w2);                   // lake: gentler, slow-rolling glow
+    else if (w2 > 0.78) tmpC.lerp(LAVA_CRUST, (w2 - 0.78) * 3.5);         // rivers: crust skins over and breaks
+    if (v.brazier) tmpC.setRGB(1.4, 0.8, 0.25).multiplyScalar(0.8 + 0.2 * Math.sin(t * 11));
+    lava.setColorAt(i, tmpC);
+  }
+  lava.instanceColor.needsUpdate = true;
+
+  // --- water shimmer
+  for (let i = 0; i < world.water.length; i++) {
+    const v = world.water[i];
+    const s = 0.5 + 0.5 * Math.sin(t * 1.4 + v.phase + v.x * 0.35 + v.z * 0.22);
+    tmpC.setHex(waterBase[i]).multiplyScalar(0.9 + s * 0.28);
+    water.setColorAt(i, tmpC);
+  }
+  water.instanceColor.needsUpdate = true;
+  water.position.y = Math.sin(t * 0.9) * 0.08;
+
+  // --- clouds drift
+  for (let i = 0; i < cloudBase.length; i++) {
+    const b = cloudBase[i];
+    const x = (b[0] + t * 1.1 + 30) % 190 - 30;
+    dummy.position.set(x, b[1], b[2]); dummy.scale.set(1, 1, 1); dummy.rotation.set(0, 0, 0); dummy.updateMatrix();
+    clouds.setMatrixAt(i, dummy.matrix);
+  }
+  clouds.instanceMatrix.needsUpdate = true;
+
+  // --- phoenix flight path: banking orbit around the volcano with periodic dives at the crater
+  const ang = t * 0.26;
+  const orbitR = 30 + 8 * Math.sin(t * 0.13);
+  const dive = Math.max(0, Math.sin(t * 0.09)) ** 4 * 16;
+  const alt = 40 + 4 * Math.sin(t * 0.61) + 5 * Math.sin(t * 0.17) - dive;
+  birdPos.set(M.VX + Math.cos(ang) * orbitR, alt, M.VZ + Math.sin(ang) * orbitR);
+  const dirx = -Math.sin(ang), dirz = Math.cos(ang);           // tangent (ccw); +X is the bird's forward
+  const yaw = Math.atan2(-dirz, dirx);
+  const climb = 4 * 0.61 * Math.cos(t * 0.61) + 5 * 0.17 * Math.cos(t * 0.17);
+  const pitch = Math.atan2(climb, orbitR * 0.26) * 0.6;
+  birdEuler.set(0, yaw, 0, 'YXZ'); birdQ.setFromEuler(birdEuler);
+  bankQ.setFromAxisAngle(AX_X, -0.42 - 0.12 * Math.sin(t * 0.9));
+  pitchQ.setFromAxisAngle(AX_Z, pitch);
+  birdQ.multiply(pitchQ).multiply(bankQ);
+  birdM.compose(birdPos, birdQ, birdScale);
+
+  // --- wing articulation: shoulder hinge + lagging wrist hinge, feather ripple along the span
+  const wt = t * 4.2;
+  const shoulder = 0.08 + 0.62 * Math.sin(wt);                 // upstroke reaches higher than the downstroke
+  const wrist = 0.45 * Math.sin(wt - 0.7);                      // hand lags the arm
+  const sinS = Math.sin(shoulder), cosS = Math.cos(shoulder);
+  const sinW = Math.sin(shoulder + wrist), cosW = Math.cos(shoulder + wrist);
+  const bob = Math.sin(wt + 1.2) * 0.35;
+  for (let i = 0; i < phoenixVox.length; i++) {
+    const v = phoenixVox[i];
+    let lx = v.x, ly = v.y, lz = v.z;
+    if (v.part === 'wing') {
+      const sp = v.span, dy = v.y - 1;
+      const ripple = Math.sin(wt - sp * 0.22) * 0.5 * (sp / WING_SPAN);
+      if (sp <= WING_WRIST) { ly = 1 + sp * sinS + dy * cosS + ripple; lz = v.side * (WING_ROOT + sp * cosS - dy * sinS); }
+      else {
+        const h = sp - WING_WRIST;
+        ly = 1 + WING_WRIST * sinS + h * sinW + dy * cosW + ripple;
+        lz = v.side * (WING_ROOT + WING_WRIST * cosS + h * cosW);
+      }
+    } else if (v.part === 'tail') {
+      const u = v.u;
+      ly = v.y + Math.sin(t * 3.0 - u * 4.5) * 2.2 * u + bob * 0.5;
+      lz = v.z + Math.sin(t * 2.2 - u * 3.5) * 1.6 * u;
+    } else if (v.part === 'crest') {
+      const u = v.u;
+      lz = v.z + Math.sin(t * 5.1 + v.phase) * 0.9 * u;
+      ly = v.y + Math.sin(t * 4.3 + v.phase) * 0.5 * u + bob;
+    } else {
+      ly = v.y + bob;
+    }
+    tmpV.set(lx, ly, lz).applyMatrix4(birdM);
+    tmpM.copy(birdM).setPosition(tmpV);
+    phoenix.setMatrixAt(i, tmpM);
+  }
+  phoenix.instanceMatrix.needsUpdate = true;
+  for (let n = 0; n < flameIdx.length; n++) {
+    const v = phoenixVox[flameIdx[n]];
+    tmpC.lerpColors(FLAME_A, FLAME_B, 0.5 + 0.5 * Math.sin(t * 9 + v.phase + v.u * 6));
+    phoenix.setColorAt(flameIdx[n], tmpC);
+  }
+  phoenix.instanceColor.needsUpdate = true;
+  phoenixLight.position.copy(birdPos);
+  phoenixLight.intensity = L(260, 650) * (0.9 + 0.1 * Math.sin(t * 9));
+
+  // --- particles
+  // embers from the lava lake
+  for (let n = 0; n < 2; n++) {
+    const r = Math.sqrt(Math.random()) * (M.CRATER_R - 1.5), a = Math.random() * 6.283;
+    spawn(embers, M.VX + Math.cos(a) * r, M.CRATER_FLOOR + 1.3, M.VZ + Math.sin(a) * r,
+      (Math.random() - 0.5) * 1.6, 3 + Math.random() * 4, (Math.random() - 0.5) * 1.6, 3 + Math.random() * 3);
+  }
+  stepParticles(embers, dt, emberCol, tt => 0.5 + tt * 0.7, [0.3 * Math.sin(t * 0.7), 0.4, 0.2 * Math.cos(t * 0.5)]);
+  // smoke column
+  if (Math.random() < 0.55) {
+    const r = Math.random() * 3, a = Math.random() * 6.283;
+    spawn(smoke, M.VX + Math.cos(a) * r, M.CRATER_FLOOR + 3, M.VZ + Math.sin(a) * r,
+      (Math.random() - 0.5) * 0.6, 2.2 + Math.random() * 1.5, (Math.random() - 0.5) * 0.6, 7 + Math.random() * 4);
+  }
+  stepParticles(smoke, dt, smokeCol, tt => 0.5 + (1 - tt) * 1.6, [0.35, 0.15, 0.1]);
+  // sparks spitting from the rivers
+  if (Math.random() < 0.5) {
+    const v = world.lava[(Math.random() * lavaCount) | 0];
+    spawn(sparks, v.x, v.y + 0.6, v.z, (Math.random() - 0.5) * 3, 3 + Math.random() * 4, (Math.random() - 0.5) * 3, 0.6 + Math.random() * 0.7);
+  }
+  stepParticles(sparks, dt, sparkCol, tt => 0.4 + tt * 0.6, [0, -12, 0]);
+  // phoenix fire trail from the tail tips and wing tips
+  const tipY = 1 + WING_WRIST * sinS + (WING_SPAN - WING_WRIST) * sinW, tipZ = WING_ROOT + WING_WRIST * cosS + (WING_SPAN - WING_WRIST) * cosW;
+  for (let n = 0; n < 4; n++) {
+    const src = n === 0 ? tmpV.set(-33, -6, 0) : (n === 1 ? tmpV.set(-27, -5, 6) : (n === 2 ? tmpV.set(-27, -5, -6) : tmpV.set(1, tipY, (Math.random() < 0.5 ? 1 : -1) * tipZ)));
+    src.applyMatrix4(birdM);
+    spawn(trail, src.x + (Math.random() - 0.5) * 0.8, src.y + (Math.random() - 0.5) * 0.8, src.z + (Math.random() - 0.5) * 0.8,
+      (Math.random() - 0.5) * 1.5 - dirx * 2, 1.5 + Math.random() * 2, (Math.random() - 0.5) * 1.5 - dirz * 2, n < 3 ? 0.9 + Math.random() * 0.6 : 0.3 + Math.random() * 0.3);
+  }
+  stepParticles(trail, dt, trailCol, tt => 0.3 + tt * 0.7, [0, 1.2, 0]);
+
+  composer.render();
+
+  // --- fps readout
+  fpsN++;
+  const now = performance.now();
+  if (now - fpsT > 500) { fpsEl.textContent = Math.round(fpsN * 1000 / (now - fpsT)); fpsN = 0; fpsT = now; }
+}
+
+document.getElementById('load').style.opacity = 0;
+setTimeout(() => document.getElementById('load').remove(), 600);
+animate();
+</script>
+</body>
+</html>
